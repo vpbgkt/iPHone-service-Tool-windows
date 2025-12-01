@@ -15,24 +15,31 @@ namespace iPhoneTool
         private string currentDeviceUdid = string.Empty;
         private System.Windows.Forms.Timer? monitorTimer = null;
         private int monitorSeconds = 0;
+        private const int MaxLogLines = 5000; // Limit log buffer to prevent memory issues
         
         public Form1()
         {
             InitializeComponent();
             // Redirect console output to the TextBox
-            var writer = new TextBoxStreamWriter(infoTextBox);
+            var writer = new TextBoxStreamWriter(infoTextBox, MaxLogLines);
             Console.SetOut(writer);
             Console.SetError(writer);
 
             // Initialize the API when the form loads.
-            this.Load += (s, e) => AppleMobileDeviceAPI.Initialize();
+            this.Load += (s, e) => {
+                AppleMobileDeviceAPI.Initialize();
+                UpdateDeviceStatus("No device detected", "");
+                UpdateProgressLabel("Ready");
+            };
             // Ensure API is shut down cleanly when the form closes.
             this.FormClosing += (s, e) => AppleMobileDeviceAPI.Shutdown();
         }
 
         private void getInfoButton_Click(object sender, EventArgs e)
         {
+            SetButtonsEnabled(false);
             infoTextBox.Text = "Searching for devices..." + Environment.NewLine;
+            UpdateProgressLabel("Detecting devices...");
 
             var iDevice = LibiMobileDevice.Instance.iDevice;
             var lockdown = LibiMobileDevice.Instance.Lockdown;
@@ -98,11 +105,19 @@ namespace iPhoneTool
 
                     currentDeviceUdid = GetStringValue(client, "UniqueDeviceID") ?? string.Empty;
                     
+                    // Update status bar with device info
+                    string deviceName = GetStringValue(client, "DeviceName") ?? "Unknown";
+                    UpdateDeviceStatus($"✅ Connected: {deviceName}", $"UDID: {currentDeviceUdid}");
+                    
                     infoTextBox.Text += "--------------------------------" + Environment.NewLine;
 
                     client.Dispose();
                     deviceHandle.Dispose();
                 }
+            }
+            else
+            {
+                UpdateDeviceStatus("No device detected", "");
             }
             
             // Check for recovery mode devices
@@ -126,16 +141,23 @@ namespace iPhoneTool
                 infoTextBox.Text += Environment.NewLine;
                 infoTextBox.Text += "ℹ️ Recovery mode devices detected!" + Environment.NewLine;
                 infoTextBox.Text += "You can now use 'Restore from IPSW' or 'Exit Recovery Mode'." + Environment.NewLine;
+                
+                // Update status for recovery mode
+                UpdateDeviceStatus($"⚠️ Recovery Mode: {recoveryDevices[0].Name}", $"Mode: {recoveryDevices[0].Mode}");
             }
             else if (count == 0)
             {
                 infoTextBox.Text += "No devices found in any mode." + Environment.NewLine;
+                UpdateDeviceStatus("No device detected", "");
                 infoTextBox.Text += Environment.NewLine;
                 infoTextBox.Text += "Please ensure:" + Environment.NewLine;
                 infoTextBox.Text += "1. Device is connected via USB" + Environment.NewLine;
                 infoTextBox.Text += "2. iTunes or Apple Mobile Device Support is installed" + Environment.NewLine;
                 infoTextBox.Text += "3. You've trusted this computer on the device" + Environment.NewLine;
             }
+            
+            SetButtonsEnabled(true);
+            UpdateProgressLabel("Ready");
         }
         
         private async void restoreButton_Click(object sender, EventArgs e)
@@ -167,21 +189,33 @@ namespace iPhoneTool
 
                     bool eraseData = (result == DialogResult.Yes);
 
-                    // Disable restore button during operation
-                    restoreButton.Enabled = false;
+                    // Disable all buttons during operation
+                    SetButtonsEnabled(false);
+                    UpdateProgressLabel("Starting restore...");
 
                     try
                     {
                         var restoreManager = new RestoreManager(
                             UpdateTextBox,
-                            UpdateProgress
+                            (value) => {
+                                UpdateProgress(value);
+                                UpdateProgressLabel($"Restoring... {value}%");
+                            }
                         );
 
                         await restoreManager.RestoreDeviceAsync(ipswPath, eraseData);
+                        UpdateProgressLabel("Restore complete!");
+                    }
+                    catch (Exception ex)
+                    {
+                        UpdateProgressLabel("Restore failed");
+                        MessageBox.Show($"Error during restore: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     }
                     finally
                     {
-                        restoreButton.Enabled = true;
+                        SetButtonsEnabled(true);
+                        UpdateProgress(0);
+                        UpdateProgressLabel("Ready");
                     }
                 }
             }
@@ -195,8 +229,16 @@ namespace iPhoneTool
         /// </summary>
         private void enterRecoveryButton_Click(object sender, EventArgs e)
         {
+            SetButtonsEnabled(false);
             infoTextBox.Text = "Entering recovery mode..." + Environment.NewLine;
-            Task.Run(() => EnterRecoveryMode());
+            UpdateProgressLabel("Entering recovery mode...");
+            Task.Run(() => {
+                EnterRecoveryMode();
+                Invoke(new Action(() => {
+                    SetButtonsEnabled(true);
+                    UpdateProgressLabel("Ready");
+                }));
+            });
         }
 
         /// <summary>
@@ -278,9 +320,10 @@ namespace iPhoneTool
         /// </summary>
         private async void exitRecoveryButton_Click(object sender, EventArgs e)
         {
-            // Disable button to prevent multiple clicks
-            exitRecoveryButton.Enabled = false;
+            // Disable all buttons to prevent multiple clicks
+            SetButtonsEnabled(false);
             infoTextBox.Text = "Starting exit recovery process...\r\n";
+            UpdateProgressLabel("Exiting recovery mode...");
             
             try
             {
@@ -344,8 +387,9 @@ namespace iPhoneTool
             }
             finally
             {
-                // Re-enable button
-                exitRecoveryButton.Enabled = true;
+                // Re-enable buttons
+                SetButtonsEnabled(true);
+                UpdateProgressLabel("Ready");
             }
         }
 
@@ -429,17 +473,148 @@ namespace iPhoneTool
         }
         
         /// <summary>
+        /// Event handler for Clear Log button
+        /// </summary>
+        private void clearLogButton_Click(object sender, EventArgs e)
+        {
+            infoTextBox.Clear();
+            infoTextBox.Text = "Log cleared.\r\n";
+        }
+
+        /// <summary>
+        /// Event handler for Save Log button
+        /// </summary>
+        private void saveLogButton_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                using (SaveFileDialog saveFileDialog = new SaveFileDialog())
+                {
+                    saveFileDialog.Filter = "Text files (*.txt)|*.txt|Log files (*.log)|*.log|All files (*.*)|*.*";
+                    saveFileDialog.Title = "Save Log File";
+                    saveFileDialog.FileName = $"iphone_tool_log_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
+
+                    if (saveFileDialog.ShowDialog() == DialogResult.OK)
+                    {
+                        File.WriteAllText(saveFileDialog.FileName, infoTextBox.Text);
+                        MessageBox.Show($"Log saved successfully to:\n{saveFileDialog.FileName}", "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error saving log: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>
+        /// Event handler for Exit menu item
+        /// </summary>
+        private void exitToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            this.Close();
+        }
+
+        /// <summary>
+        /// Event handler for About menu item
+        /// </summary>
+        private void aboutToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            MessageBox.Show(
+                "iPhone Service Tool v1.0\n\n" +
+                "A comprehensive tool for iOS device management:\n" +
+                "• Device information retrieval\n" +
+                "• IPSW firmware restore\n" +
+                "• Recovery mode entry/exit\n\n" +
+                "Built with libimobiledevice\n" +
+                "© 2025",
+                "About iPhone Service Tool",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// Enable or disable all action buttons
+        /// </summary>
+        private void SetButtonsEnabled(bool enabled)
+        {
+            try
+            {
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() => SetButtonsEnabled(enabled)));
+                    return;
+                }
+                
+                getInfoButton.Enabled = enabled;
+                restoreButton.Enabled = enabled;
+                enterRecoveryButton.Enabled = enabled;
+                exitRecoveryButton.Enabled = enabled;
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        /// <summary>
+        /// Updates the device status in the status bar
+        /// </summary>
+        private void UpdateDeviceStatus(string status, string udidInfo)
+        {
+            try
+            {
+                if (statusStrip.InvokeRequired)
+                {
+                    statusStrip.Invoke(new Action(() => {
+                        deviceStatusLabel.Text = status;
+                        udidStatusLabel.Text = udidInfo;
+                    }));
+                }
+                else
+                {
+                    deviceStatusLabel.Text = status;
+                    udidStatusLabel.Text = udidInfo;
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        /// <summary>
+        /// Updates the progress label text
+        /// </summary>
+        private void UpdateProgressLabel(string text)
+        {
+            try
+            {
+                if (progressLabel.InvokeRequired)
+                {
+                    progressLabel.Invoke(new Action(() => {
+                        progressLabel.Text = text;
+                    }));
+                }
+                else
+                {
+                    progressLabel.Text = text;
+                }
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
+
+        /// <summary>
         /// Helper class to redirect Console.WriteLine output to a TextBox control.
-        /// Handles cross-thread calls safely.
+        /// Handles cross-thread calls safely and limits buffer size.
         /// </summary>
         public class TextBoxStreamWriter : TextWriter
         {
             private TextBox _output;
             private StringBuilder _buffer = new StringBuilder();
+            private int _maxLines;
 
-            public TextBoxStreamWriter(TextBox output)
+            public TextBoxStreamWriter(TextBox output, int maxLines = 5000)
             {
                 _output = output;
+                _maxLines = maxLines;
             }
 
             public override void Write(char value)
@@ -459,15 +634,28 @@ namespace iPhoneTool
                     _output.BeginInvoke(new Action(() =>
                     {
                         _output.AppendText(_buffer.ToString());
+                        TrimLogIfNeeded();
                         _output.ScrollToCaret();
                     }));
                 }
                 else
                 {
                     _output.AppendText(_buffer.ToString());
+                    TrimLogIfNeeded();
                     _output.ScrollToCaret();
                 }
                 _buffer.Clear();
+            }
+
+            private void TrimLogIfNeeded()
+            {
+                // Trim log to prevent memory issues
+                var lines = _output.Lines;
+                if (lines.Length > _maxLines)
+                {
+                    var keepLines = lines.Skip(lines.Length - _maxLines).ToArray();
+                    _output.Lines = keepLines;
+                }
             }
 
             public override Encoding Encoding
